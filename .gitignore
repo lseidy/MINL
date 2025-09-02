@@ -3,11 +3,8 @@
 *.PDF
 *.zip
 *.ZIP
-
-# Common extras
-# Byte-compiled / cache
-__pycache__/
-*.py[cod]
+*.png
+*.log
 
 # Jupyter
 .ipynb_checkpoints/
