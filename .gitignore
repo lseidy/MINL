@@ -1,0 +1,19 @@
+# Ignore all PDF and ZIP files across the repository
+*.pdf
+*.PDF
+*.zip
+*.ZIP
+
+# Common extras
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# WandB artifacts
+.wandb/
