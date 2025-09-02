@@ -5,6 +5,11 @@
 *.ZIP
 *.png
 *.log
+*.json
+*.txt
+*.sh
+*.LFR
+*.pyc
 
 # Jupyter
 .ipynb_checkpoints/
