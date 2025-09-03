@@ -15,6 +15,7 @@ from networks.cnn import SmallCNN
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import torch.nn.functional as F  # <-- ADICIONE
 
 
 def normalize_path(p: str) -> str:
@@ -193,6 +194,54 @@ def assemble_mosaic(pred_mis: torch.Tensor, Hm: int, Wm: int) -> torch.Tensor:
     return mosaic
 
 
+def psnr_torch(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
+    """PSNR entre imagens (C,H,W) em [0,1]. Retorna escalar tensor."""
+    mse = F.mse_loss(pred, target, reduction='mean')
+    return 10.0 * torch.log10((max_val * max_val) / (mse + 1e-12))
+
+def _gaussian_kernel2d(ksize: int = 11, sigma: float = 1.5, device=None, dtype=None) -> torch.Tensor:
+    ax = torch.arange(ksize, device=device, dtype=dtype) - (ksize - 1) / 2.0
+    g1 = torch.exp(-0.5 * (ax / sigma) ** 2)
+    g1 = g1 / g1.sum()
+    g2 = g1[:, None] * g1[None, :]
+    g2 = g2 / g2.sum()
+    return g2
+
+def ssim_torch(x: torch.Tensor, y: torch.Tensor, max_val: float = 1.0, ksize: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """SSIM entre (C,H,W) ou (B,C,H,W) em [0,1]. Retorna escalar tensor (média no batch e canais)."""
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+    if y.dim() == 3:
+        y = y.unsqueeze(0)
+    B, C, H, W = x.shape
+    device, dtype = x.device, x.dtype
+
+    kernel = _gaussian_kernel2d(ksize, sigma, device=device, dtype=dtype)
+    kernel = kernel.expand(C, 1, ksize, ksize).contiguous()  # (C,1,K,K)
+
+    pad = ksize // 2
+    x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
+    y_pad = F.pad(y, (pad, pad, pad, pad), mode='reflect')
+
+    mu_x = F.conv2d(x_pad, kernel, groups=C)
+    mu_y = F.conv2d(y_pad, kernel, groups=C)
+
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x = F.conv2d(x_pad * x_pad, kernel, groups=C) - mu_x2
+    sigma_y = F.conv2d(y_pad * y_pad, kernel, groups=C) - mu_y2
+    sigma_xy = F.conv2d(x_pad * y_pad, kernel, groups=C) - mu_xy
+
+    C1 = (0.01 * max_val) ** 2
+    C2 = (0.03 * max_val) ** 2
+
+    numerator = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
+    denominator = (mu_x2 + mu_y2 + C1) * (sigma_x + sigma_y + C2)
+    ssim_map = numerator / (denominator + 1e-12)
+    return ssim_map.mean()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -203,7 +252,7 @@ def main():
     )
     parser.add_argument("--resize", type=int, nargs=2, metavar=("W","H"), default=None,
                         help="redimensionar para (W H); omita para usar resolução original")
-    parser.add_argument("--L", type=int, default=6, help="número de bandas para position encoding")
+    parser.add_argument("--L", type=int, default=10, help="número de bandas para position encoding")
     parser.add_argument("--include-input", action="store_true", help="concatena coordenadas originais ao encoding")
     parser.add_argument("--alpha", type=float, default=1e-4, help="coeficiente alpha para regularização L1")
     parser.add_argument("--epochs", type=int, default=250, help="número de épocas de treino")
@@ -212,7 +261,7 @@ def main():
     parser.add_argument("--lr-end", type=float, default=1e-4, help="learning rate final ao fim do treino")
     parser.add_argument("--save-recon", action="store_true", help="salvar reconstruções (centro das micro-imagens) a cada --save-interval épocas")
     parser.add_argument("--save-interval", type=int, default=10, help="intervalo (épocas) entre salvamentos quando --save-recon ativado")
-    parser.add_argument("--save-dir", type=str, default="/mnt/c/Users/lucas/Documents/Mestrado/MINL/output_minl/", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
+    parser.add_argument("--save-dir", type=str, default="/mnt/c/Users/lucas/Documents/Mestrado/MINL/output_minl/Ankylosaurus_atemp_3", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
     parser.add_argument("--num-workers", type=int, default=0, help="workers do DataLoader (Windows: 0 ou 2)")
     parser.add_argument("--micro-size", type=int, default=11, help="tamanho da micro-imagem (U=V)")
     args = parser.parse_args()
@@ -232,6 +281,10 @@ def main():
     lf = reshape_lenslet(tensor, micro=int(args.micro_size))
     C, Hm, Wm, U, V = lf.shape
     print(f"Light field lenslet -> (C,Hm,Wm,U,V) = {(C,Hm,Wm,U,V)}")
+
+    # Mosaico ground-truth (para métricas PSNR/SSIM)
+    gt_mis = lf.permute(1, 2, 0, 3, 4).contiguous().view(Hm * Wm, C, U, V)  # (Hm*Wm, C, U, V)
+    mosaic_gt = assemble_mosaic(gt_mis, Hm=Hm, Wm=Wm).clamp(0.0, 1.0)       # (C, Hm*U, Wm*V)
 
     # Dataset MI-wise
     lenslet_ds = LensletMicroDataset(lf, L=args.L, include_input=args.include_input)
@@ -279,6 +332,8 @@ def main():
     print(f"Iniciando treino: samples={len(lenslet_ds)} epochs={epochs} batch_size={args.batch_size} lr_start={lr_start} lr_end={lr_end} alpha={alpha}")
     loss_history: list[float] = []
     entropy_history: list[float] = []
+    psnr_history: list[float] = []   # <-- ADICIONE
+    ssim_history: list[float] = []   # <-- ADICIONE
 
     # Salvar mosaico da época 0 (antes do treinamento)
     try:
@@ -301,6 +356,14 @@ def main():
         out_path = os.path.join(save_dir, "mosaic_ep0.png")
         pil.save(out_path)
         print(f"Salvo mosaico inicial (época 0) em: {out_path}")
+
+        # Métricas iniciais
+        try:
+            psnr0 = psnr_torch(mosaic.clamp(0,1), mosaic_gt).item()
+            ssim0 = ssim_torch(mosaic.clamp(0,1), mosaic_gt).item()
+            print(f"Ep 0: PSNR={psnr0:.3f} dB | SSIM={ssim0:.4f}")
+        except Exception as e:
+            print(f"Falha ao calcular PSNR/SSIM na época 0: {e}")
     except Exception as e:
         print(f"Falha ao salvar mosaico da época 0 em '{save_dir}': {e}")
         import traceback; traceback.print_exc()
@@ -357,37 +420,8 @@ def main():
         loss_history.append(avg_loss)
         entropy_history.append(avg_entropy)
 
-        # save metric plots every epoch (or can be throttled)
-        raw_save_dir = args.save_dir or folder
-        save_dir = normalize_path(raw_save_dir) if isinstance(raw_save_dir, str) else folder
-        try:
-            os.makedirs(save_dir, exist_ok=True)              
-        except Exception as e:
-            print(f"Falha ao criar diretório de salvamento '{save_dir}': {e}")
-            import traceback
-            traceback.print_exc()
-        try:
-            fig, axes = plt.subplots(2, 1, figsize=(6, 8))
-            axes[0].plot(range(1, len(loss_history) + 1), loss_history, '-o')
-            axes[0].set_title('Training loss per epoch')
-            axes[0].set_xlabel('Epoch')
-            axes[0].set_ylabel('Loss')
-            axes[1].plot(range(1, len(entropy_history) + 1), entropy_history, '-o', color='tab:orange')
-            axes[1].set_title('Cross-entropy (GT vs pred) per epoch')
-            axes[1].set_xlabel('Epoch')
-            axes[1].set_ylabel('Cross-entropy (bits)')
-            plt.tight_layout()
-            # Always overwrite the same metrics file so we don't accumulate per-epoch files.
-            metrics_path = os.path.join(save_dir, 'training_metrics.png')
-            fig.savefig(metrics_path)
-            # verify file was written
-            plt.close(fig)
-        except Exception as e:
-            print(f"Falha ao salvar plots de métricas em '{save_dir}': {e}")
-            import traceback
-            traceback.print_exc()
-
         # salvar reconstrução a cada intervalo: mosaico completo Hm*U x Wm*V
+        current_psnr, current_ssim = float('nan'), float('nan')  # valores desta época
         if ((ep+1) % save_interval == 0):
             raw_save_dir = args.save_dir or folder
             save_dir = normalize_path(raw_save_dir) if isinstance(raw_save_dir, str) else folder
@@ -405,14 +439,59 @@ def main():
                         preds.append(pred_batch.cpu())
                 mlp.train(); cnn.train()
                 preds = torch.cat(preds, dim=0)  # (Hm*Wm, C, U, V)
-                mosaic = assemble_mosaic(preds, Hm=Hm, Wm=Wm)  # (C, Hm*U, Wm*V)
-                pil = transforms.ToPILImage()(mosaic)
+                mosaic_pred = assemble_mosaic(preds, Hm=Hm, Wm=Wm).clamp(0.0, 1.0)  # (C, Hm*U, Wm*V)
+
+                # métricas desta época
+                current_psnr = psnr_torch(mosaic_pred, mosaic_gt).item()
+                current_ssim = ssim_torch(mosaic_pred, mosaic_gt).item()
+                print(f"Ep {ep+1}: PSNR={current_psnr:.3f} dB | SSIM={current_ssim:.4f}")
+
+                pil = transforms.ToPILImage()(mosaic_pred)
                 out_path = os.path.join(save_dir, f"mosaic_ep{ep+1}.png")
                 pil.save(out_path)
             except Exception as e:
                 print(f"Erro ao salvar mosaico na época {ep+1} em '{save_dir}': {e}")
                 import traceback
                 traceback.print_exc()
+
+        # atualiza históricos PSNR/SSIM (NaN quando não salvo nesta época)
+        psnr_history.append(current_psnr)
+        ssim_history.append(current_ssim)
+
+        # save metric plots every epoch (agora com PSNR/SSIM)
+        raw_save_dir = args.save_dir or folder
+        save_dir = normalize_path(raw_save_dir) if isinstance(raw_save_dir, str) else folder
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Falha ao criar diretório de salvamento '{save_dir}': {e}")
+            import traceback; traceback.print_exc()
+
+        try:
+            fig, axes = plt.subplots(4, 1, figsize=(7, 12))
+            epochs_axis = range(1, len(loss_history) + 1)
+
+            axes[0].plot(epochs_axis, loss_history, '-o')
+            axes[0].set_title('Training loss per epoch')
+            axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
+
+            axes[1].plot(epochs_axis, entropy_history, '-o', color='tab:orange')
+            axes[1].set_title('Cross-entropy (GT vs pred) per epoch')
+            axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Cross-entropy (bits)')
+
+            axes[2].plot(epochs_axis, psnr_history, '-o', color='tab:green')
+            axes[2].set_title('PSNR per epoch (mosaic)'); axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('PSNR (dB)')
+
+            axes[3].plot(epochs_axis, ssim_history, '-o', color='tab:red')
+            axes[3].set_title('SSIM per epoch (mosaic)'); axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('SSIM')
+
+            plt.tight_layout()
+            metrics_path = os.path.join(save_dir, 'training_metrics.png')
+            fig.savefig(metrics_path)
+            plt.close(fig)
+        except Exception as e:
+            print(f"Falha ao salvar plots de métricas em '{save_dir}': {e}")
+            import traceback; traceback.print_exc()
 
     print("Treino concluído")
 
@@ -442,7 +521,15 @@ def main():
                         preds.append(pred_batch.cpu())
                 mlp.train(); cnn.train()
                 preds = torch.cat(preds, dim=0)
-                mosaic = assemble_mosaic(preds, Hm=Hm, Wm=Wm)
+                mosaic = assemble_mosaic(preds, Hm=Hm, Wm=Wm).clamp(0.0, 1.0)
+                # métricas finais
+                try:
+                    psnrF = psnr_torch(mosaic, mosaic_gt).item()
+                    ssimF = ssim_torch(mosaic, mosaic_gt).item()
+                    print(f"Final: PSNR={psnrF:.3f} dB | SSIM={ssimF:.4f}")
+                except Exception as e:
+                    print(f"Falha ao calcular PSNR/SSIM (final): {e}")
+                # salvar imagem
                 pil = transforms.ToPILImage()(mosaic)
                 out_path = os.path.join(save_dir, f"mosaic_final_ep{epochs}.png")
                 pil.save(out_path)
