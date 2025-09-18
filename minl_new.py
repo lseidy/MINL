@@ -4,7 +4,6 @@ from pathlib import Path
 import os
 import platform
 from typing import Callable, List, Optional, Tuple
-
 from PIL import Image
 import torch
 import torch.nn as nn
@@ -16,6 +15,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch.nn.functional as F  # <-- ADICIONE
+
+try:
+    # AIMET (quantização) - carregado de forma opcional
+    from aimet_torch.quantsim import QuantizationSimModel
+    from aimet_torch.defs import QuantScheme
+    _AIMET_AVAILABLE = True
+except Exception:  # ImportError ou outros
+    _AIMET_AVAILABLE = False
 
 
 def normalize_path(p: str) -> str:
@@ -247,7 +254,7 @@ def main():
     parser.add_argument(
         "--image",
         type=str,
-        default="/mnt/c/Users/lucas/Documents/Mestrado/MINL/Dataset/Original_11x11_center/Ankylosaurus.png",
+        default="/home/seidy/lucas/MINL/Dataset/Original_11x11_center/Ankylosaurus.png",
         help="Caminho para a imagem (aceita /mnt/ WSL ou caminho Windows)",
     )
     parser.add_argument("--resize", type=int, nargs=2, metavar=("W","H"), default=None,
@@ -261,9 +268,18 @@ def main():
     parser.add_argument("--lr-end", type=float, default=1e-4, help="learning rate final ao fim do treino")
     parser.add_argument("--save-recon", action="store_true", help="salvar reconstruções (centro das micro-imagens) a cada --save-interval épocas")
     parser.add_argument("--save-interval", type=int, default=10, help="intervalo (épocas) entre salvamentos quando --save-recon ativado")
-    parser.add_argument("--save-dir", type=str, default="/mnt/c/Users/lucas/Documents/Mestrado/MINL/output_minl/Ankylosaurus_atemp_3", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
+    parser.add_argument("--save-dir", type=str, default="output/Ankylosaurus_PTQ/", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
     parser.add_argument("--num-workers", type=int, default=0, help="workers do DataLoader (Windows: 0 ou 2)")
     parser.add_argument("--micro-size", type=int, default=11, help="tamanho da micro-imagem (U=V)")
+    # ---- Quantização PTQ AIMET ----
+    parser.add_argument("--ptq-enable", action="store_true", help="Ativa quantização PTQ (AIMET) após o treino base")
+    parser.add_argument("--ptq-calib-batches", type=int, default=10, help="Número de batches usados na calibração compute_encodings")
+    parser.add_argument("--ptq-act-bits", type=int, default=8, help="Bits para ativações")
+    parser.add_argument("--ptq-wt-bits", type=int, default=8, help="Bits para pesos")
+    parser.add_argument("--ptq-quant-scheme", type=str, default="tf", choices=["tf","tf_enhanced","percentile"], help="QuantScheme AIMET")
+    parser.add_argument("--ptq-percentile", type=float, default=99.9, help="Percentil (se scheme=percentile)")
+    parser.add_argument("--ptq-output-dir", type=str, default="quant_export", help="Diretório para exportar modelo/encodings quantizados")
+    parser.add_argument("--ptq-eval-mosaic", action="store_true", help="Gera mosaico usando modelo quantizado pós-calibração")
     args = parser.parse_args()
 
     # enforce single save_interval int used everywhere
@@ -296,6 +312,19 @@ def main():
     out_patch_dim = C * U * V
     mlp = SimpleMLP(in_dim=in_dim, hidden=512, out_dim=out_patch_dim).to(device)
     cnn = SmallCNN(in_channels=C, hidden=64).to(device)
+
+    # Wrapper para AIMET combinar mlp -> reshape -> cnn
+    class CombinedModel(nn.Module):
+        def __init__(self, mlp: nn.Module, cnn: nn.Module, C: int, U: int, V: int):
+            super().__init__()
+            self.mlp = mlp
+            self.cnn = cnn
+            self.C = C; self.U = U; self.V = V
+        def forward(self, x: torch.Tensor):
+            out = self.mlp(x).view(-1, self.C, self.U, self.V)
+            out = self.cnn(out)
+            return out
+    combined = CombinedModel(mlp, cnn, C, U, V).to(device)
 
     # DataLoader
     from torch.utils.data import DataLoader
@@ -494,6 +523,122 @@ def main():
             import traceback; traceback.print_exc()
 
     print("Treino concluído")
+
+    # ================= PTQ (AIMET) =================
+    if args.ptq_enable:
+        if not _AIMET_AVAILABLE:
+            print("[PTQ] AIMET não está instalado. Pule ou instale: pip install aimet-torch (ver doc oficial).")
+        else:
+            print("[PTQ] Iniciando fluxo de quantização pós-treino (PTQ) AIMET... - Bits pesos: {}  ativações: {}  scheme: {}".format(args.ptq_wt_bits, args.ptq_act_bits, args.ptq_quant_scheme))
+            quant_scheme_map = {
+                'tf': QuantScheme.post_training_tf,
+                'tf_enhanced': QuantScheme.post_training_tf_enhanced,
+                'percentile': QuantScheme.post_training_percentile
+            }
+            qscheme = quant_scheme_map[args.ptq_quant_scheme]
+            sim = QuantizationSimModel(
+                model=combined,
+                quant_scheme=qscheme,
+                default_output_bw=args.ptq_act_bits,
+                default_param_bw=args.ptq_wt_bits,
+                dummy_input=torch.randn(2, lenslet_ds.in_dim, device=device)
+            )
+            if args.ptq_quant_scheme == 'percentile':
+                # Configurar percentil (ativações) conforme documentação AIMET
+                for qc in sim.quant_wrappers():
+                    for quantizer in qc.output_quantizers:
+                        quantizer.is_percentile_enabled = True
+                        quantizer.percentile_value = args.ptq_percentile
+            # Função de calibração
+            from torch.utils.data import DataLoader
+            calib_loader = DataLoader(lenslet_ds, batch_size=min(args.batch_size, 1024), shuffle=False,
+                                      num_workers=args.num_workers, pin_memory=pin_memory)
+            def forward_pass(model, _: Optional[None] = None):
+                model.eval()
+                batches = 0
+                with torch.no_grad():
+                    for xb_calib, _ in calib_loader:
+                        xb_calib = xb_calib.to(device, non_blocking=pin_memory)
+                        _ = model(xb_calib)
+                        batches += 1
+                        if batches >= args.ptq_calib_batches:
+                            break
+            print(f"[PTQ] Calibrando encodings usando até {args.ptq_calib_batches} batches...")
+            sim.compute_encodings(forward_pass, None)
+            print("[PTQ] Encodings computados.")
+
+            # Avaliação opcional do modelo quantizado
+            if args.ptq_eval_mosaic:
+                print("[PTQ] Gerando mosaico quantizado para métricas...")
+                try:
+                    recon_loader = DataLoader(lenslet_ds, batch_size=args.batch_size, shuffle=False,
+                                              num_workers=args.num_workers, pin_memory=pin_memory)
+                    preds_q = []
+                    sim.model.eval()
+                    with torch.no_grad():
+                        for xb_batch, _ in recon_loader:
+                            xb_batch = xb_batch.to(device, non_blocking=pin_memory)
+                            pred_batch = sim.model(xb_batch).cpu()
+                            preds_q.append(pred_batch)
+                    preds_q = torch.cat(preds_q, dim=0)
+                    mosaic_q = assemble_mosaic(preds_q.view(Hm*Wm, C, U, V), Hm=Hm, Wm=Wm).clamp(0,1)
+                    try:
+                        psnr_q = psnr_torch(mosaic_q, mosaic_gt).item()
+                        ssim_q = ssim_torch(mosaic_q, mosaic_gt).item()
+                        print(f"[PTQ] Quantizado: PSNR={psnr_q:.3f} dB | SSIM={ssim_q:.4f}")
+                    except Exception as e:
+                        print(f"[PTQ] Falha métricas quantizadas: {e}")
+                    q_dir = normalize_path(args.ptq_output_dir)
+                    os.makedirs(q_dir, exist_ok=True)
+                    out_q_img = os.path.join(q_dir, "mosaic_quant.png")
+                    transforms.ToPILImage()(mosaic_q).save(out_q_img)
+                    print(f"[PTQ] Mosaico quantizado salvo em: {out_q_img}")
+                    # Salvar métricas em JSON + gráfico comparativo
+                    try:
+                        import json
+                        metrics_json = {
+                            "psnr_history_float": psnr_history,
+                            "ssim_history_float": ssim_history,
+                            "psnr_quant": psnr_q if 'psnr_q' in locals() else None,
+                            "ssim_quant": ssim_q if 'ssim_q' in locals() else None,
+                            "epochs": len(psnr_history)
+                        }
+                        with open(os.path.join(q_dir, 'ptq_metrics.json'), 'w') as f_json:
+                            json.dump(metrics_json, f_json, indent=2)
+                        # Gráfico comparativo PSNR / SSIM
+                        try:
+                            fig2, axes2 = plt.subplots(2, 1, figsize=(6, 8))
+                            epochs_axis = list(range(1, len(psnr_history)+1))
+                            axes2[0].plot(epochs_axis, psnr_history, '-o', label='Float (treino)')
+                            if 'psnr_q' in locals():
+                                axes2[0].axhline(psnr_q, color='r', linestyle='--', label=f'Quant ({psnr_q:.2f} dB)')
+                            axes2[0].set_title('PSNR Float vs Quantizado')
+                            axes2[0].set_xlabel('Epoch'); axes2[0].set_ylabel('PSNR (dB)'); axes2[0].legend()
+                            axes2[1].plot(epochs_axis, ssim_history, '-o', label='Float (treino)', color='tab:orange')
+                            if 'ssim_q' in locals():
+                                axes2[1].axhline(ssim_q, color='r', linestyle='--', label=f'Quant ({ssim_q:.4f})')
+                            axes2[1].set_title('SSIM Float vs Quantizado')
+                            axes2[1].set_xlabel('Epoch'); axes2[1].set_ylabel('SSIM'); axes2[1].legend()
+                            plt.tight_layout()
+                            comp_path = os.path.join(q_dir, 'ptq_comparison.png')
+                            fig2.savefig(comp_path)
+                            plt.close(fig2)
+                            print(f"[PTQ] Gráfico comparativo salvo em: {comp_path}")
+                        except Exception as e:
+                            print(f"[PTQ] Falha ao gerar gráfico comparativo: {e}")
+                    except Exception as e:
+                        print(f"[PTQ] Falha ao salvar JSON de métricas PTQ: {e}")
+                except Exception as e:
+                    print(f"[PTQ] Erro ao gerar mosaico quantizado: {e}")
+
+            # Export
+            export_dir = normalize_path(args.ptq_output_dir)
+            os.makedirs(export_dir, exist_ok=True)
+            try:
+                sim.export(path=export_dir, filename_prefix="minl_ptq", dummy_input=torch.randn(1, lenslet_ds.in_dim, device=device))
+                print(f"[PTQ] Artefatos exportados para: {export_dir}")
+            except Exception as e:
+                print(f"[PTQ] Falha ao exportar artefatos: {e}")
 
     # If user asked to save reconstructions but the final epoch wasn't on a save interval,
     # save one final reconstruction now so the user always gets the last prediction.
