@@ -125,7 +125,11 @@ class ImageDataset(Dataset):
 
 
 def positional_encoding(coords: torch.Tensor, L: int = 6, include_input: bool = False) -> torch.Tensor:
-    """Aplica Position Encoding tipo Fourier às coordenadas.
+    """Aplica Position Encoding tipo Fourier às coordenadas, robusto a overflow.
+
+    - Para L alto (ex.: 250), 2**k em float32 pode estourar (Inf) e gerar NaN em sin/cos.
+      Para evitar isso, realizamos o cálculo das frequências e dos ângulos em float64 e
+      depois convertemos de volta para o dtype original.
 
     Args:
         coords: tensor de forma (..., 2) com coordenadas normalizadas em [0,1].
@@ -137,20 +141,40 @@ def positional_encoding(coords: torch.Tensor, L: int = 6, include_input: bool = 
     """
     if not torch.is_tensor(coords):
         coords = torch.tensor(coords)
-    dtype = coords.dtype
+    orig_dtype = coords.dtype
     device = coords.device
-    # freqs: (L,)
-    freqs = (2 ** torch.arange(L, dtype=dtype, device=device)) * torch.pi
-    # coords: (..., 2) -> angles: (..., L, 2)
-    angles = coords[..., None, :] * freqs[None, :, None]
-    s = torch.sin(angles)
-    c = torch.cos(angles)
-    # concat sin and cos along last dim -> (..., L, 4)
-    combined = torch.cat([s, c], dim=-1)
-    # flatten L and feature dims -> (..., 4*L)
+
+    # Cálculo em float64 para evitar overflow de 2**k em float32
+    coords64 = coords.to(torch.float64)
+    try:
+        freqs64 = (2.0 ** torch.arange(L, dtype=torch.float64, device=device)) * torch.pi.to(torch.float64)
+    except Exception:
+        # Fallback simples caso torch.pi não suporte to(float64) em alguma build
+        import math as _math
+        freqs64 = (2.0 ** torch.arange(L, dtype=torch.float64, device=device)) * _math.pi
+
+    # coords: (..., 2) -> angles: (..., L, 2) em float64
+    angles64 = coords64[..., None, :] * freqs64[None, :, None]
+    s64 = torch.sin(angles64)
+    c64 = torch.cos(angles64)
+
+    # Concatena e volta ao dtype original
+    combined64 = torch.cat([s64, c64], dim=-1)  # (..., L, 4)
+    combined = combined64.to(orig_dtype)
+
+    # Flatten L e features -> (..., 4*L)
     out = combined.view(*coords.shape[:-1], -1)
     if include_input:
         out = torch.cat([coords, out], dim=-1)
+    # Aviso opcional para L muito alto (apenas uma vez por processo)
+    if L >= 128:
+        # Use um guard de módulo para avisar apenas uma vez
+        g = globals()
+        if '_PE_HIGH_L_WARNED' not in g:
+            g['_PE_HIGH_L_WARNED'] = False
+        if not g['_PE_HIGH_L_WARNED']:
+            print(f"[PE][WARN] L={L} é bastante alto; o encoding é calculado em float64 para evitar overflow, o que pode aumentar custo.")
+            g['_PE_HIGH_L_WARNED'] = True
     return out
 
 
@@ -337,7 +361,7 @@ def main():
     parser.add_argument("--L", type=int, default=250, help="número de bandas para position encoding")
     parser.add_argument("--include-input", action="store_true", help="concatena coordenadas originais ao encoding")
     parser.add_argument("--alpha", type=float, default=1e-4, help="coeficiente alpha para regularização L1")
-    parser.add_argument("--epochs", type=int, default= 1, help="número de épocas de treino")
+    parser.add_argument("--epochs", type=int, default= 250, help="número de épocas de treino")
     parser.add_argument("--batch-size", type=int, default=5000, help="tamanho do minibatch (patches)")
     parser.add_argument("--lr-start", type=float, default=1e-2, help="learning rate inicial para Adam")
     parser.add_argument("--lr-end", type=float, default=1e-4, help="learning rate final ao fim do treino")
@@ -353,11 +377,17 @@ def main():
     parser.add_argument("--cnn-blocks", type=int, default=2, help="número de blocos conv (3x3) na CNN")
     parser.add_argument("--cnn-out-activation", action="store_true", help="aplica ativação Sine na saída da CNN")
     # Reprodutibilidade e checkpoints
-    parser.add_argument("--seed", type=int, default=None, help="Seed global para inicialização (torch, numpy, random)")
+    parser.add_argument("--seed", type=int, default=13, help="Seed global para inicialização (torch, numpy, random)")
     parser.add_argument("--save-ckpt", action="store_true", help="Salvar checkpoints por época (pesos e otimizador)")
     parser.add_argument("--ckpt-interval", type=int, default=10, help="Intervalo de épocas para checkpoint")
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints/teste/", help="Diretório para salvar checkpoints")
     parser.add_argument("--log-file", type=str, default="log_test.txt", help="Arquivo de log para salvar métricas e eventos")
+    # Estabilidade numérica
+    parser.add_argument("--nan-guard", action="store_true", help="Detecta e corrige NaNs/Infs durante o treino e na avaliação de métricas")
+    parser.add_argument("--grad-clip", type=float, default=0.0, help="Se > 0, aplica clipping de gradiente pelo norm (ex: 1.0)")
+    parser.add_argument("--debug-nan", action="store_true", help="Ativa detecção de anomalias do autograd e logs quando aparecerem NaN/Inf")
+    parser.add_argument("--resume-latest", action="store_true", help="Se habilitado, tenta retomar do último checkpoint em --ckpt-dir")
+    parser.add_argument("--resume-from", type=str, default=None, help="Caminho para um checkpoint específico (.pth) para retomar")
     # ---- Quantização PTQ AIMET ----
     parser.add_argument("--ptq-enable", action="store_true", help="Ativa quantização PTQ (AIMET) após o treino base")
     parser.add_argument("--ptq-calib-batches", type=int, default=10, help="Número de batches usados na calibração compute_encodings")
@@ -465,6 +495,19 @@ def main():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     tensor = load_image(img_path, resize=tuple(args.resize) if args.resize else None)
+    # Debug/anomalias
+    if args.debug_nan:
+        try:
+            torch.autograd.set_detect_anomaly(True)
+            print("[DEBUG-NAN] Autograd anomaly detection ativado.")
+        except Exception as e:
+            print(f"[DEBUG-NAN] Falha ao ativar anomaly detection: {e}")
+
+    def _chk(name: str, t: torch.Tensor):
+        if args.debug_nan:
+            if not torch.isfinite(t).all():
+                num_bad = (~torch.isfinite(t)).sum().item()
+                print(f"[DEBUG-NAN] {name} possui {num_bad} valores não finitos.")
     print(f"Imagem carregada: {img_path}")
     print(f"Tensor shape: {tuple(tensor.shape)}  dtype={tensor.dtype}")
 
@@ -538,6 +581,49 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     alpha = float(args.alpha)
 
+    # ====== RESUME (opcional) ======
+    start_epoch = 0
+    def _load_checkpoint(path: str):
+        nonlocal start_epoch, loss_history, entropy_history, psnr_history, ssim_history
+        print(f"[RESUME] Carregando checkpoint: {path}")
+        ckpt = torch.load(path, map_location=device)
+        mlp.load_state_dict(ckpt['mlp_state'])
+        cnn.load_state_dict(ckpt['cnn_state'])
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state'])
+        except Exception as e:
+            print(f"[RESUME] Aviso: não foi possível restaurar optimizer: {e}")
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state'])
+        except Exception as e:
+            print(f"[RESUME] Aviso: não foi possível restaurar scheduler: {e}")
+        # epoch salvo é 1-indexed (ep+1); retomamos do mesmo índice como zero-based loop
+        start_epoch = int(ckpt.get('epoch', 0))
+        # restaurar históricos (se existirem)
+        loss_history = list(ckpt.get('loss_history', []))
+        entropy_history = list(ckpt.get('entropy_history', []))
+        psnr_history = list(ckpt.get('psnr_history', []))
+        ssim_history = list(ckpt.get('ssim_history', []))
+        print(f"[RESUME] Retomando a partir da época {start_epoch+1} até {epochs}")
+        try:
+            _append_log(f"RESUME FROM {path} START_EPOCH={start_epoch+1}")
+        except Exception:
+            pass
+
+    if args.resume_from:
+        _load_checkpoint(normalize_path(args.resume_from))
+    elif args.resume_latest:
+        try:
+            import glob
+            ckpt_dir = normalize_path(args.ckpt_dir)
+            latest = sorted(glob.glob(os.path.join(ckpt_dir, 'minl_ep*.pth')))
+            if latest:
+                _load_checkpoint(latest[-1])
+            else:
+                print(f"[RESUME] Nenhum checkpoint encontrado em {ckpt_dir}; iniciando do zero.")
+        except Exception as e:
+            print(f"[RESUME] Falha ao localizar checkpoint: {e}")
+
     print(f"\n[Iniciando treino]\n samples={len(lenslet_ds)} epochs={epochs} batch_size={args.batch_size} lr_start={lr_start} lr_end={lr_end} alpha={alpha}")
     loss_history: list[float] = []
     entropy_history: list[float] = []
@@ -560,10 +646,23 @@ def main():
             for xb_batch, _ in recon_loader:
                 xb_batch = xb_batch.to(device, non_blocking=pin_memory)
                 pred_batch = cnn(mlp(xb_batch).view(-1, C, U, V))
+                if args.nan_guard and (not torch.isfinite(pred_batch).all()):
+                    print("[NAN-GUARD] Predições iniciais contêm valores não finitos; aplicando nan_to_num.")
+                    pred_batch = torch.nan_to_num(pred_batch, nan=0.0, posinf=1.0, neginf=0.0)
                 preds.append(pred_batch.cpu())
         mlp.train(); cnn.train()
         preds = torch.cat(preds, dim=0)  # (Hm*Wm, C, U, V)
+        # sanitize and clamp to avoid NaNs/Inf in epoch-0 mosaic
+        try:
+            preds = torch.nan_to_num(preds, nan=0.0, posinf=1.0, neginf=0.0)
+        except Exception:
+            pass
         mosaic = assemble_mosaic(preds, Hm=Hm, Wm=Wm)
+        try:
+            mosaic = torch.nan_to_num(mosaic, nan=0.0, posinf=1.0, neginf=0.0)
+        except Exception:
+            pass
+        mosaic = mosaic.clamp(0.0, 1.0)
         pil = transforms.ToPILImage()(mosaic)
         out_path = os.path.join(save_dir, "mosaic_ep0.png")
         pil.save(out_path)
@@ -582,7 +681,7 @@ def main():
         print(f"Falha ao salvar mosaico da época 0 em '{save_dir}': {e}")
         import traceback; traceback.print_exc()
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         running_loss = 0.0
         it = 0
         total_entropy = 0.0
@@ -592,8 +691,16 @@ def main():
             yb = yb.to(device, non_blocking=pin_memory)  # (B, C, U, V)
             optimizer.zero_grad()
             mlp_out = mlp(xb)                      # (B, C*U*V)
+            _chk('mlp_out', mlp_out)
             mlp_micro = mlp_out.view(-1, C, U, V)  # (B, C, U, V)
             pred = cnn(mlp_micro)                  # (B, C, U, V)
+            _chk('pred', pred)
+            if args.nan_guard and (not torch.isfinite(pred).all()):
+                print("[NAN-GUARD] Predições contêm NaN/Inf; aplicando nan_to_num.")
+                pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
+            if args.nan_guard and (not torch.isfinite(yb).all()):
+                print("[NAN-GUARD] Alvos contêm NaN/Inf; aplicando nan_to_num.")
+                yb = torch.nan_to_num(yb, nan=0.0, posinf=1.0, neginf=0.0)
 
             diff = pred - yb
             loss_l2 = diff.view(diff.shape[0], -1).pow(2).sum(dim=1).mean()
@@ -602,7 +709,10 @@ def main():
             l1_reg = sum(p.abs().sum() for p in params)
             loss = loss_l2 + alpha * l1_reg
 
+            _chk('loss_before_backward', loss.detach())
             loss.backward()
+            if float(args.grad_clip) and args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(list(mlp.parameters()) + list(cnn.parameters()), max_norm=float(args.grad_clip))
             optimizer.step()
 
             running_loss += loss.item()
@@ -652,9 +762,14 @@ def main():
                     for xb_batch, _ in recon_loader:
                         xb_batch = xb_batch.to(device, non_blocking=pin_memory)
                         pred_batch = cnn(mlp(xb_batch).view(-1, C, U, V))
+                        if args.nan_guard and (not torch.isfinite(pred_batch).all()):
+                            print("[NAN-GUARD] Predições (época) contêm valores não finitos; aplicando nan_to_num.")
+                            pred_batch = torch.nan_to_num(pred_batch, nan=0.0, posinf=1.0, neginf=0.0)
                         preds.append(pred_batch.cpu())
                 mlp.train(); cnn.train()
                 preds = torch.cat(preds, dim=0)  # (Hm*Wm, C, U, V)
+                if args.nan_guard:
+                    preds = torch.nan_to_num(preds, nan=0.0, posinf=1.0, neginf=0.0)
                 mosaic_pred = assemble_mosaic(preds, Hm=Hm, Wm=Wm).clamp(0.0, 1.0)  # (C, Hm*U, Wm*V)
 
                 # métricas desta época
@@ -818,8 +933,13 @@ def main():
                         for xb_batch, _ in recon_loader:
                             xb_batch = xb_batch.to(device, non_blocking=pin_memory)
                             pred_batch = sim.model(xb_batch).cpu()
+                            if args.nan_guard and (not torch.isfinite(pred_batch).all()):
+                                print("[NAN-GUARD] Predições quantizadas contêm valores não finitos; aplicando nan_to_num.")
+                                pred_batch = torch.nan_to_num(pred_batch, nan=0.0, posinf=1.0, neginf=0.0)
                             preds_q.append(pred_batch)
                     preds_q = torch.cat(preds_q, dim=0)
+                    if args.nan_guard:
+                        preds_q = torch.nan_to_num(preds_q, nan=0.0, posinf=1.0, neginf=0.0)
                     mosaic_q = assemble_mosaic(preds_q.view(Hm*Wm, C, U, V), Hm=Hm, Wm=Wm).clamp(0,1)
                     try:
                         psnr_q = psnr_torch(mosaic_q, mosaic_gt).item()
@@ -953,6 +1073,8 @@ def main():
                                     for xb_batch, _ in recon_loader:
                                         xb_batch = xb_batch.to(device, non_blocking=pin_memory)
                                         pred_batch = sim_ck.model(xb_batch).cpu()
+                                        if args.nan_guard and (not torch.isfinite(pred_batch).all()):
+                                            pred_batch = torch.nan_to_num(pred_batch, nan=0.0, posinf=1.0, neginf=0.0)
                                         preds_q.append(pred_batch)
                                 preds_q = torch.cat(preds_q, dim=0)
                                 mosaic_q = assemble_mosaic(preds_q.view(Hm*Wm, C, U, V), Hm=Hm, Wm=Wm).clamp(0,1)
