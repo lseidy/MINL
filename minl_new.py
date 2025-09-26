@@ -347,7 +347,7 @@ def main():
     parser.add_argument(
         "--image",
         type=str,
-        default="/home/seidy/lucas/MINL/Dataset/Original_11x11_center/Black_Fence.png",
+        default="/home/seidy/lucas/MINL/Dataset/Original_11x11_center/Ankylosaurus.png",
         help="Caminho para a imagem (aceita /mnt/ WSL ou caminho Windows)",
     )
     parser.add_argument(
@@ -384,7 +384,7 @@ def main():
     parser.add_argument("--log-file", type=str, default="log_test.txt", help="Arquivo de log para salvar métricas e eventos")
     # Estabilidade numérica
     parser.add_argument("--nan-guard", action="store_true", help="Detecta e corrige NaNs/Infs durante o treino e na avaliação de métricas")
-    parser.add_argument("--grad-clip", type=float, default=0.0, help="Se > 0, aplica clipping de gradiente pelo norm (ex: 1.0)")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Se > 0, aplica clipping de gradiente pelo norm (ex: 1.0)")
     parser.add_argument("--debug-nan", action="store_true", help="Ativa detecção de anomalias do autograd e logs quando aparecerem NaN/Inf")
     parser.add_argument("--resume-latest", action="store_true", help="Se habilitado, tenta retomar do último checkpoint em --ckpt-dir")
     parser.add_argument("--resume-from", type=str, default=None, help="Caminho para um checkpoint específico (.pth) para retomar")
@@ -568,17 +568,21 @@ def main():
     total_params = mlp_params + cnn_params
     print(f"\nTrainable parameters: mlp={mlp_params:,}  cnn={cnn_params:,}  Total={total_params:,}")
 
-    # otimizador e scheduler linear do lr_start -> lr_end em 'epochs'
+    # Otimizador e agendamento linear robusto do lr_start -> lr_end ao longo de 'epochs'
     lr_start = float(args.lr_start)
     lr_end = float(args.lr_end)
     optimizer = torch.optim.Adam(list(mlp.parameters()) + list(cnn.parameters()), lr=lr_start)
     epochs = int(args.epochs)
-    
-    def lr_lambda(epoch_idx: int):
+
+    def lr_at_epoch(ep_idx: int) -> float:
         if epochs <= 1:
-            return lr_end / lr_start
-        return 1.0 - (1.0 - (lr_end / lr_start)) * (epoch_idx / max(1, epochs - 1))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+            return lr_end
+        t = max(0, min(ep_idx, epochs - 1))
+        return lr_start + (lr_end - lr_start) * (t / float(epochs - 1))
+
+    # Garante LR consistente já no início
+    for g in optimizer.param_groups:
+        g['lr'] = lr_at_epoch(0)
     alpha = float(args.alpha)
 
     # ====== RESUME (opcional) ======
@@ -734,7 +738,9 @@ def main():
                 total_entropy += batch_xent * pred.shape[0]
                 total_samples_entropy += pred.shape[0]
 
-        scheduler.step()
+        # Atualiza LR do início desta época (linear, nunca negativo)
+        for g in optimizer.param_groups:
+            g['lr'] = lr_at_epoch(ep)
         avg_loss = running_loss / max(1, it)
         avg_entropy = total_entropy / total_samples_entropy if total_samples_entropy > 0 else 0.0
         current_lr = optimizer.param_groups[0]['lr']
@@ -813,7 +819,13 @@ def main():
                     'mlp_state': mlp.state_dict(),
                     'cnn_state': cnn.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
+                    # Não usamos mais um scheduler do PyTorch; salvamos metadados do agendamento manual
+                    'scheduler_state': {
+                        'type': 'manual_linear',
+                        'lr_start': lr_start,
+                        'lr_end': lr_end,
+                        'epochs': epochs
+                    },
                     'args': vars(args),
                     'psnr_history': psnr_history,
                     'ssim_history': ssim_history,
