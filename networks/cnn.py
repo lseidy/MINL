@@ -1,25 +1,25 @@
 import torch
 from torch import nn
-
-
-class Sine(nn.Module):
-    """Simple sine activation: sin(x)."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sin(x)
+from .activations import Sine
 
 
 class SmallCNN(nn.Module):
-    """Refinement CNN: recebe micro-imagem (B,C,11,11) e retorna micro-imagem (B,C,11,11)."""
-    def __init__(self, in_channels: int = 3, hidden: int = 64):
+    """Refinement CNN over micro-images (B,C,H,W)."""
+    def __init__(self, in_channels: int = 3, hidden: int = 64, num_blocks: int = 2, out_activation: bool = True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
-            Sine(),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
-            Sine(),
-            nn.Conv2d(hidden, in_channels, kernel_size=3, padding=1),
-            Sine(),  # output in [0,1]
-        )
+        layers = []
+        # first conv
+        layers.append(nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1))
+        layers.append(Sine())
+        # middle conv blocks
+        for _ in range(max(0, num_blocks - 1)):
+            layers.append(nn.Conv2d(hidden, hidden, kernel_size=3, padding=1))
+            layers.append(Sine())
+        # projection back to input channels
+        layers.append(nn.Conv2d(hidden, in_channels, kernel_size=3, padding=1))
+        if out_activation:
+            layers.append(Sine())
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W) -> (B, C, H, W)

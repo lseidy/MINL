@@ -3,6 +3,8 @@ import argparse
 from pathlib import Path
 import os
 import platform
+import sys
+import subprocess
 from typing import Callable, List, Optional, Tuple
 from PIL import Image
 import torch
@@ -16,10 +18,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch.nn.functional as F  # <-- ADICIONE
 
+
 try:
     # AIMET (quantização) - carregado de forma opcional
     from aimet_torch.quantsim import QuantizationSimModel
-    from aimet_torch.defs import QuantScheme
+    from aimet_common.defs import QuantScheme
+    from aimet_torch.nn import QuantizationMixin
     _AIMET_AVAILABLE = True
 except Exception:  # ImportError ou outros
     _AIMET_AVAILABLE = False
@@ -152,6 +156,7 @@ def positional_encoding(coords: torch.Tensor, L: int = 6, include_input: bool = 
 
 def reshape_lenslet(img_chw: torch.Tensor, micro: int = 11) -> torch.Tensor:
     """(C, Htot, Wtot) -> (C, Hm, Wm, U, V), com U=V=micro; recorta bordas para múltiplos de micro."""
+    
     C, Htot, Wtot = img_chw.shape
     Hm, Wm = Htot // micro, Wtot // micro
     if Hm == 0 or Wm == 0:
@@ -160,7 +165,6 @@ def reshape_lenslet(img_chw: torch.Tensor, micro: int = 11) -> torch.Tensor:
     img_crop = img_chw[:, :Hc, :Wc].contiguous()
     lf = img_crop.view(C, Hm, micro, Wm, micro).permute(0, 1, 3, 2, 4).contiguous()
     return lf  # (C, Hm, Wm, U, V)
-
 
 class LensletMicroDataset(Dataset):
     """Amostra MI-wise: (PE(x,y), micro-imagem GT) do LF lenslet (C,Hm,Wm,U,V)."""
@@ -199,7 +203,6 @@ def assemble_mosaic(pred_mis: torch.Tensor, Hm: int, Wm: int) -> torch.Tensor:
             mosaic[:, y0:y0+U, x0:x0+V] = pred_mis[idx]
             idx += 1
     return mosaic
-
 
 def psnr_torch(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
     """PSNR entre imagens (C,H,W) em [0,1]. Retorna escalar tensor."""
@@ -249,28 +252,112 @@ def ssim_torch(x: torch.Tensor, y: torch.Tensor, max_val: float = 1.0, ksize: in
     ssim_map = numerator / (denominator + 1e-12)
     return ssim_map.mean()
 
+# Modelo combinado em escopo de módulo (pickleável) para AIMET/PTQ
+class CombinedModel(nn.Module):
+    def __init__(self, mlp: nn.Module, cnn: nn.Module, C: int, U: int, V: int):
+        super().__init__()
+        self.mlp = mlp
+        self.cnn = cnn
+        self.C = C
+        self.U = U
+        self.V = V
+
+    def forward(self, x: torch.Tensor):
+        out = self.mlp(x).view(-1, self.C, self.U, self.V)
+        out = self.cnn(out)
+        return out
+
+# Implementações quantizadas para AIMET
+if _AIMET_AVAILABLE:
+    from networks.mlp import Sine as SineMLP
+    from networks.cnn import Sine as SineCNN
+    
+    @QuantizationMixin.implements(SineMLP)
+    class QuantizedSineMLP(QuantizationMixin, SineMLP):
+        def __quant_init__(self):
+            super().__quant_init__()
+            # Declare the number of input/output quantizers
+            self.input_quantizers = torch.nn.ModuleList([None])
+            self.output_quantizers = torch.nn.ModuleList([None])
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Quantize input tensors
+            if self.input_quantizers[0]:
+                x = self.input_quantizers[0](x)
+
+            # Run forward with quantized inputs and parameters
+            with self._patch_quantized_parameters():
+                ret = super().forward(x)
+
+            # Quantize output tensors
+            if self.output_quantizers[0]:
+                ret = self.output_quantizers[0](ret)
+
+            return ret
+
+    @QuantizationMixin.implements(SineCNN)
+    class QuantizedSineCNN(QuantizationMixin, SineCNN):
+        def __quant_init__(self):
+            super().__quant_init__()
+            # Declare the number of input/output quantizers
+            self.input_quantizers = torch.nn.ModuleList([None])
+            self.output_quantizers = torch.nn.ModuleList([None])
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Quantize input tensors
+            if self.input_quantizers[0]:
+                x = self.input_quantizers[0](x)
+
+            # Run forward with quantized inputs and parameters
+            with self._patch_quantized_parameters():
+                ret = super().forward(x)
+
+            # Quantize output tensors
+            if self.output_quantizers[0]:
+                ret = self.output_quantizers[0](ret)
+
+            return ret
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--image",
         type=str,
-        default="/home/seidy/lucas/MINL/Dataset/Original_11x11_center/Ankylosaurus.png",
+        default="/home/seidy/lucas/MINL/Dataset/Original_11x11_center/Black_Fence.png",
         help="Caminho para a imagem (aceita /mnt/ WSL ou caminho Windows)",
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=str,
+        default=None,
+        help="Executa o pipeline para TODAS as imagens da pasta (png/jpg/jpeg/bmp/tif/tiff). Cada imagem terá diretórios de saída próprios.",
     )
     parser.add_argument("--resize", type=int, nargs=2, metavar=("W","H"), default=None,
                         help="redimensionar para (W H); omita para usar resolução original")
-    parser.add_argument("--L", type=int, default=10, help="número de bandas para position encoding")
+    parser.add_argument("--L", type=int, default=250, help="número de bandas para position encoding")
     parser.add_argument("--include-input", action="store_true", help="concatena coordenadas originais ao encoding")
     parser.add_argument("--alpha", type=float, default=1e-4, help="coeficiente alpha para regularização L1")
-    parser.add_argument("--epochs", type=int, default=250, help="número de épocas de treino")
+    parser.add_argument("--epochs", type=int, default= 1, help="número de épocas de treino")
     parser.add_argument("--batch-size", type=int, default=5000, help="tamanho do minibatch (patches)")
     parser.add_argument("--lr-start", type=float, default=1e-2, help="learning rate inicial para Adam")
     parser.add_argument("--lr-end", type=float, default=1e-4, help="learning rate final ao fim do treino")
     parser.add_argument("--save-recon", action="store_true", help="salvar reconstruções (centro das micro-imagens) a cada --save-interval épocas")
     parser.add_argument("--save-interval", type=int, default=10, help="intervalo (épocas) entre salvamentos quando --save-recon ativado")
-    parser.add_argument("--save-dir", type=str, default="output/Ankylosaurus_PTQ/", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
+    parser.add_argument("--save-dir", type=str, default="output/teste/", help="diretório para salvar imagens reconstruídas (padrão: mesmo diretório da imagem)")
     parser.add_argument("--num-workers", type=int, default=0, help="workers do DataLoader (Windows: 0 ou 2)")
     parser.add_argument("--micro-size", type=int, default=11, help="tamanho da micro-imagem (U=V)")
+    # Arquitetura MLP/CNN
+    parser.add_argument("--mlp-hidden", type=int, default=128, help="tamanho do hidden do MLP")
+    parser.add_argument("--mlp-layers", type=int, default=1, help="número de camadas ocultas do MLP")
+    parser.add_argument("--cnn-hidden", type=int, default=64, help="número de canais ocultos da CNN")
+    parser.add_argument("--cnn-blocks", type=int, default=2, help="número de blocos conv (3x3) na CNN")
+    parser.add_argument("--cnn-out-activation", action="store_true", help="aplica ativação Sine na saída da CNN")
+    # Reprodutibilidade e checkpoints
+    parser.add_argument("--seed", type=int, default=None, help="Seed global para inicialização (torch, numpy, random)")
+    parser.add_argument("--save-ckpt", action="store_true", help="Salvar checkpoints por época (pesos e otimizador)")
+    parser.add_argument("--ckpt-interval", type=int, default=10, help="Intervalo de épocas para checkpoint")
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints/teste/", help="Diretório para salvar checkpoints")
+    parser.add_argument("--log-file", type=str, default="log_test.txt", help="Arquivo de log para salvar métricas e eventos")
     # ---- Quantização PTQ AIMET ----
     parser.add_argument("--ptq-enable", action="store_true", help="Ativa quantização PTQ (AIMET) após o treino base")
     parser.add_argument("--ptq-calib-batches", type=int, default=10, help="Número de batches usados na calibração compute_encodings")
@@ -278,17 +365,119 @@ def main():
     parser.add_argument("--ptq-wt-bits", type=int, default=8, help="Bits para pesos")
     parser.add_argument("--ptq-quant-scheme", type=str, default="tf", choices=["tf","tf_enhanced","percentile"], help="QuantScheme AIMET")
     parser.add_argument("--ptq-percentile", type=float, default=99.9, help="Percentil (se scheme=percentile)")
-    parser.add_argument("--ptq-output-dir", type=str, default="quant_export", help="Diretório para exportar modelo/encodings quantizados")
+    parser.add_argument("--ptq-output-dir", type=str, default="output/teste_PTQ/", help="Diretório para exportar modelo/encodings quantizados")
     parser.add_argument("--ptq-eval-mosaic", action="store_true", help="Gera mosaico usando modelo quantizado pós-calibração")
+    parser.add_argument("--ptq-eval-per-epoch", action="store_true", help="(Opcional) Avalia PSNR/SSIM com PTQ durante o treino nas épocas em que salvamos mosaicos. Por padrão PTQ roda só após o treino.")
+    parser.add_argument("--ptq-sweep-checkpoints", action="store_true", help="(Opcional) Após o treino, varre checkpoints salvos e calcula PSNR/SSIM PTQ por checkpoint para gerar uma curva PTQ por época.")
     args = parser.parse_args()
+
+    # Deprecated flag handling: PTQ is strictly post-training now; this flag is a no-op.
+    if getattr(args, 'ptq_eval_per_epoch', False):
+        print("[WARN] --ptq-eval-per-epoch está depreciado e não tem efeito. O PTQ ocorre apenas após o treino. Use --ptq-sweep-checkpoints para analisar por época.")
+
+    # Execução em lote: processa todas as imagens de um diretório chamando este script recursivamente
+    if args.image_dir:
+        img_dir = normalize_path(args.image_dir.rstrip('}'))  # tolera '}' no final
+        pdir = Path(img_dir)
+        if not pdir.exists() or not pdir.is_dir():
+            print(f"[MULTI-RUN] Diretório inválido: {img_dir}")
+            return
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        files = sorted([str(f) for f in pdir.rglob("*") if f.is_file() and f.suffix.lower() in exts])
+        if not files:
+            print(f"[MULTI-RUN] Nenhuma imagem encontrada em: {img_dir}")
+            return
+        print(f"[MULTI-RUN] Encontradas {len(files)} imagens em '{img_dir}'. Iniciando processamento...\n")
+
+        for idx, fpath in enumerate(files, 1):
+            name = Path(fpath).stem
+            save_dir = os.path.join("output", name)
+            ckpt_dir = os.path.join("checkpoints", name)
+            ptq_dir = os.path.join("output", f"{name}_PTQ")
+
+            cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--image", fpath,
+                "--L", str(args.L),
+                "--alpha", str(args.alpha),
+                "--epochs", str(args.epochs),
+                "--batch-size", str(args.batch_size),
+                "--lr-start", str(args.lr_start),
+                "--lr-end", str(args.lr_end),
+                "--save-interval", str(int(getattr(args, "save_interval", 10))),
+                "--num-workers", str(args.num_workers),
+                "--micro-size", str(args.micro_size),
+                "--mlp-hidden", str(args.mlp_hidden),
+                "--mlp-layers", str(args.mlp_layers),
+                "--cnn-hidden", str(args.cnn_hidden),
+                "--cnn-blocks", str(args.cnn_blocks),
+                *( ["--cnn-out-activation"] if args.cnn_out_activation else [] ),
+                "--save-dir", save_dir,
+                "--ckpt-dir", ckpt_dir,
+            ]
+            if args.resize:
+                w, h = args.resize
+                cmd += ["--resize", str(w), str(h)]
+            if args.include_input:
+                cmd += ["--include-input"]
+            if args.save_recon:
+                cmd += ["--save-recon"]
+            if args.seed is not None:
+                cmd += ["--seed", str(args.seed)]
+            if args.save_ckpt:
+                cmd += ["--save-ckpt", "--ckpt-interval", str(args.ckpt_interval)]
+            if args.ptq_enable:
+                cmd += [
+                    "--ptq-enable",
+                    "--ptq-calib-batches", str(args.ptq_calib_batches),
+                    "--ptq-act-bits", str(args.ptq_act_bits),
+                    "--ptq-wt-bits", str(args.ptq_wt_bits),
+                    "--ptq-quant-scheme", str(args.ptq_quant_scheme),
+                    "--ptq-percentile", str(args.ptq_percentile),
+                    "--ptq-output-dir", ptq_dir,
+                ]
+                if args.ptq_eval_mosaic:
+                    cmd += ["--ptq-eval-mosaic"]
+                if args.ptq_sweep_checkpoints:
+                    cmd += ["--ptq-sweep-checkpoints"]
+
+            print(f"[MULTI-RUN] ({idx}/{len(files)}) Executando para: {fpath}")
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"[MULTI-RUN] Falha ao processar '{fpath}': {e}")
+        print("[MULTI-RUN] Finalizado processamento de todas as imagens.")
+        return
 
     # enforce single save_interval int used everywhere
     save_interval = int(getattr(args, "save_interval", 10))
 
     img_path = args.image
+    # Seed global
+    if args.seed is not None:
+        import random, numpy as np
+        print(f"[SEED] Configurando seed global: {args.seed}")
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     tensor = load_image(img_path, resize=tuple(args.resize) if args.resize else None)
     print(f"Imagem carregada: {img_path}")
     print(f"Tensor shape: {tuple(tensor.shape)}  dtype={tensor.dtype}")
+
+    # Função simples para anexar mensagens em um log.txt
+    def _append_log(msg: str):
+        try:
+            log_dir = normalize_path(getattr(args, 'save_dir', '.'))
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, args.log_file)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(str(msg).rstrip('\n') + '\n')
+        except Exception:
+            pass
 
     # Diretório da imagem para fallback de salvamento
     folder = str(Path(normalize_path(img_path)).parent)
@@ -310,20 +499,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     in_dim = lenslet_ds.in_dim
     out_patch_dim = C * U * V
-    mlp = SimpleMLP(in_dim=in_dim, hidden=512, out_dim=out_patch_dim).to(device)
-    cnn = SmallCNN(in_channels=C, hidden=64).to(device)
+    mlp = SimpleMLP(in_dim=in_dim, hidden=int(args.mlp_hidden), out_dim=out_patch_dim, num_layers=int(args.mlp_layers)).to(device)
+    cnn = SmallCNN(in_channels=C, hidden=int(args.cnn_hidden), num_blocks=int(args.cnn_blocks), out_activation=bool(args.cnn_out_activation)).to(device)
 
     # Wrapper para AIMET combinar mlp -> reshape -> cnn
-    class CombinedModel(nn.Module):
-        def __init__(self, mlp: nn.Module, cnn: nn.Module, C: int, U: int, V: int):
-            super().__init__()
-            self.mlp = mlp
-            self.cnn = cnn
-            self.C = C; self.U = U; self.V = V
-        def forward(self, x: torch.Tensor):
-            out = self.mlp(x).view(-1, self.C, self.U, self.V)
-            out = self.cnn(out)
-            return out
     combined = CombinedModel(mlp, cnn, C, U, V).to(device)
 
     # DataLoader
@@ -344,13 +523,14 @@ def main():
     mlp_params = _count_params(mlp)
     cnn_params = _count_params(cnn)
     total_params = mlp_params + cnn_params
-    print(f"Trainable parameters: mlp={mlp_params:,}  cnn={cnn_params:,}  total={total_params:,}")
+    print(f"\nTrainable parameters: mlp={mlp_params:,}  cnn={cnn_params:,}  Total={total_params:,}")
 
     # otimizador e scheduler linear do lr_start -> lr_end em 'epochs'
     lr_start = float(args.lr_start)
     lr_end = float(args.lr_end)
     optimizer = torch.optim.Adam(list(mlp.parameters()) + list(cnn.parameters()), lr=lr_start)
     epochs = int(args.epochs)
+    
     def lr_lambda(epoch_idx: int):
         if epochs <= 1:
             return lr_end / lr_start
@@ -358,11 +538,14 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     alpha = float(args.alpha)
 
-    print(f"Iniciando treino: samples={len(lenslet_ds)} epochs={epochs} batch_size={args.batch_size} lr_start={lr_start} lr_end={lr_end} alpha={alpha}")
+    print(f"\n[Iniciando treino]\n samples={len(lenslet_ds)} epochs={epochs} batch_size={args.batch_size} lr_start={lr_start} lr_end={lr_end} alpha={alpha}")
     loss_history: list[float] = []
     entropy_history: list[float] = []
     psnr_history: list[float] = []   # <-- ADICIONE
     ssim_history: list[float] = []   # <-- ADICIONE
+    # Históricos de métricas quantizadas (preenchidos nas épocas salvas)
+    ptq_psnr_history: list[float] = []
+    ptq_ssim_history: list[float] = []
 
     # Salvar mosaico da época 0 (antes do treinamento)
     try:
@@ -385,12 +568,14 @@ def main():
         out_path = os.path.join(save_dir, "mosaic_ep0.png")
         pil.save(out_path)
         print(f"Salvo mosaico inicial (época 0) em: {out_path}")
+        _append_log(f"EP0_SAVE {out_path}")
 
         # Métricas iniciais
         try:
             psnr0 = psnr_torch(mosaic.clamp(0,1), mosaic_gt).item()
             ssim0 = ssim_torch(mosaic.clamp(0,1), mosaic_gt).item()
             print(f"Ep 0: PSNR={psnr0:.3f} dB | SSIM={ssim0:.4f}")
+            _append_log(f"EP0_METRIC PSNR={psnr0:.6f} SSIM={ssim0:.6f}")
         except Exception as e:
             print(f"Falha ao calcular PSNR/SSIM na época 0: {e}")
     except Exception as e:
@@ -444,13 +629,15 @@ def main():
         avg_entropy = total_entropy / total_samples_entropy if total_samples_entropy > 0 else 0.0
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {ep+1}/{epochs}  avg_loss={avg_loss:.6e}  loss_l2={loss_l2.item():.6e}  l1_reg={l1_reg.item():.6e}  lr={current_lr:.6e}")
+        _append_log(f"EPOCH {ep+1} avg_loss={avg_loss:.6e} loss_l2={loss_l2.item():.6e} l1_reg={l1_reg.item():.6e} lr={current_lr:.6e} xent={avg_entropy:.6f}")
         
         # record histories
         loss_history.append(avg_loss)
         entropy_history.append(avg_entropy)
 
         # salvar reconstrução a cada intervalo: mosaico completo Hm*U x Wm*V
-        current_psnr, current_ssim = float('nan'), float('nan')  # valores desta época
+        current_psnr, current_ssim = float('nan'), float('nan')  # valores desta época (float)
+        current_psnr_q, current_ssim_q = float('nan'), float('nan')  # valores desta época (quantizado)
         if ((ep+1) % save_interval == 0):
             raw_save_dir = args.save_dir or folder
             save_dir = normalize_path(raw_save_dir) if isinstance(raw_save_dir, str) else folder
@@ -474,10 +661,13 @@ def main():
                 current_psnr = psnr_torch(mosaic_pred, mosaic_gt).item()
                 current_ssim = ssim_torch(mosaic_pred, mosaic_gt).item()
                 print(f"Ep {ep+1}: PSNR={current_psnr:.3f} dB | SSIM={current_ssim:.4f}")
+                _append_log(f"EPOCH {ep+1} PSNR={current_psnr:.6f} SSIM={current_ssim:.6f}")
 
                 pil = transforms.ToPILImage()(mosaic_pred)
                 out_path = os.path.join(save_dir, f"mosaic_ep{ep+1}.png")
                 pil.save(out_path)
+
+                # (Removido) PTQ por época não é calculado aqui. PTQ é executado apenas após o treino.
             except Exception as e:
                 print(f"Erro ao salvar mosaico na época {ep+1} em '{save_dir}': {e}")
                 import traceback
@@ -486,6 +676,8 @@ def main():
         # atualiza históricos PSNR/SSIM (NaN quando não salvo nesta época)
         psnr_history.append(current_psnr)
         ssim_history.append(current_ssim)
+        ptq_psnr_history.append(current_psnr_q)
+        ptq_ssim_history.append(current_ssim_q)
 
         # save metric plots every epoch (agora com PSNR/SSIM)
         raw_save_dir = args.save_dir or folder
@@ -495,6 +687,31 @@ def main():
         except Exception as e:
             print(f"Falha ao criar diretório de salvamento '{save_dir}': {e}")
             import traceback; traceback.print_exc()
+
+        # Checkpoint por época
+        if args.save_ckpt and ((ep+1) % int(args.ckpt_interval) == 0):
+            try:
+                ckpt_dir = normalize_path(args.ckpt_dir)
+                os.makedirs(ckpt_dir, exist_ok=True)
+                ckpt = {
+                    'epoch': ep+1,
+                    'mlp_state': mlp.state_dict(),
+                    'cnn_state': cnn.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'scheduler_state': scheduler.state_dict(),
+                    'args': vars(args),
+                    'psnr_history': psnr_history,
+                    'ssim_history': ssim_history,
+                    'loss_history': loss_history,
+                    'entropy_history': entropy_history,
+                }
+                ckpt_path = os.path.join(ckpt_dir, f"minl_ep{ep+1:04d}.pth")
+                torch.save(ckpt, ckpt_path)
+                print(f"[CKPT] Checkpoint salvo: {ckpt_path}")
+                _append_log(f"CKPT {ep+1} {ckpt_path}")
+            except Exception as e:
+                print(f"[CKPT] Falha ao salvar checkpoint: {e}")
+                import traceback; traceback.print_exc()
 
         try:
             fig, axes = plt.subplots(4, 1, figsize=(7, 12))
@@ -508,15 +725,33 @@ def main():
             axes[1].set_title('Cross-entropy (GT vs pred) per epoch')
             axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Cross-entropy (bits)')
 
-            axes[2].plot(epochs_axis, psnr_history, '-o', color='tab:green')
+            axes[2].plot(epochs_axis, psnr_history, '-o', color='tab:green', label='Float')
+            # série PTQ: plota somente se houver algum valor finito
+            try:
+                import numpy as _np
+                _has_ptq_psnr = any(_np.isfinite(v) for v in ptq_psnr_history)
+            except Exception:
+                _has_ptq_psnr = False
+            if _has_ptq_psnr:
+                axes[2].plot(epochs_axis, ptq_psnr_history, 'x--', color='tab:olive', label='PTQ')
             axes[2].set_title('PSNR per epoch (mosaic)'); axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('PSNR (dB)')
+            axes[2].legend(loc='best')
 
-            axes[3].plot(epochs_axis, ssim_history, '-o', color='tab:red')
+            axes[3].plot(epochs_axis, ssim_history, '-o', color='tab:red', label='Float')
+            try:
+                import numpy as _np
+                _has_ptq_ssim = any(_np.isfinite(v) for v in ptq_ssim_history)
+            except Exception:
+                _has_ptq_ssim = False
+            if _has_ptq_ssim:
+                axes[3].plot(epochs_axis, ptq_ssim_history, 'x--', color='tab:pink', label='PTQ')
             axes[3].set_title('SSIM per epoch (mosaic)'); axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('SSIM')
+            axes[3].legend(loc='best')
 
             plt.tight_layout()
             metrics_path = os.path.join(save_dir, 'training_metrics.png')
             fig.savefig(metrics_path)
+            _append_log(f"EPOCH {ep+1} METRICS_PLOT {metrics_path}")
             plt.close(fig)
         except Exception as e:
             print(f"Falha ao salvar plots de métricas em '{save_dir}': {e}")
@@ -566,6 +801,10 @@ def main():
             print(f"[PTQ] Calibrando encodings usando até {args.ptq_calib_batches} batches...")
             sim.compute_encodings(forward_pass, None)
             print("[PTQ] Encodings computados.")
+            try:
+                _append_log("PTQ ENCODINGS_DONE")
+            except Exception:
+                pass
 
             # Avaliação opcional do modelo quantizado
             if args.ptq_eval_mosaic:
@@ -586,6 +825,10 @@ def main():
                         psnr_q = psnr_torch(mosaic_q, mosaic_gt).item()
                         ssim_q = ssim_torch(mosaic_q, mosaic_gt).item()
                         print(f"[PTQ] Quantizado: PSNR={psnr_q:.3f} dB | SSIM={ssim_q:.4f}")
+                        try:
+                            _append_log(f"PTQ_METRIC PSNR={psnr_q:.6f} SSIM={ssim_q:.6f}")
+                        except Exception:
+                            pass
                     except Exception as e:
                         print(f"[PTQ] Falha métricas quantizadas: {e}")
                     q_dir = normalize_path(args.ptq_output_dir)
@@ -593,52 +836,178 @@ def main():
                     out_q_img = os.path.join(q_dir, "mosaic_quant.png")
                     transforms.ToPILImage()(mosaic_q).save(out_q_img)
                     print(f"[PTQ] Mosaico quantizado salvo em: {out_q_img}")
+                    try:
+                        _append_log(f"PTQ_SAVE {out_q_img}")
+                    except Exception:
+                        pass
                     # Salvar métricas em JSON + gráfico comparativo
                     try:
                         import json
                         metrics_json = {
                             "psnr_history_float": psnr_history,
                             "ssim_history_float": ssim_history,
-                            "psnr_quant": psnr_q if 'psnr_q' in locals() else None,
-                            "ssim_quant": ssim_q if 'ssim_q' in locals() else None,
+                            "psnr_history_ptq": ptq_psnr_history if 'ptq_psnr_history' in locals() else None,
+                            "ssim_history_ptq": ptq_ssim_history if 'ptq_ssim_history' in locals() else None,
+                            "psnr_quant_final": psnr_q if 'psnr_q' in locals() else None,
+                            "ssim_quant_final": ssim_q if 'ssim_q' in locals() else None,
                             "epochs": len(psnr_history)
                         }
                         with open(os.path.join(q_dir, 'ptq_metrics.json'), 'w') as f_json:
                             json.dump(metrics_json, f_json, indent=2)
-                        # Gráfico comparativo PSNR / SSIM
-                        try:
-                            fig2, axes2 = plt.subplots(2, 1, figsize=(6, 8))
-                            epochs_axis = list(range(1, len(psnr_history)+1))
-                            axes2[0].plot(epochs_axis, psnr_history, '-o', label='Float (treino)')
-                            if 'psnr_q' in locals():
-                                axes2[0].axhline(psnr_q, color='r', linestyle='--', label=f'Quant ({psnr_q:.2f} dB)')
-                            axes2[0].set_title('PSNR Float vs Quantizado')
-                            axes2[0].set_xlabel('Epoch'); axes2[0].set_ylabel('PSNR (dB)'); axes2[0].legend()
-                            axes2[1].plot(epochs_axis, ssim_history, '-o', label='Float (treino)', color='tab:orange')
-                            if 'ssim_q' in locals():
-                                axes2[1].axhline(ssim_q, color='r', linestyle='--', label=f'Quant ({ssim_q:.4f})')
-                            axes2[1].set_title('SSIM Float vs Quantizado')
-                            axes2[1].set_xlabel('Epoch'); axes2[1].set_ylabel('SSIM'); axes2[1].legend()
-                            plt.tight_layout()
-                            comp_path = os.path.join(q_dir, 'ptq_comparison.png')
-                            fig2.savefig(comp_path)
-                            plt.close(fig2)
-                            print(f"[PTQ] Gráfico comparativo salvo em: {comp_path}")
-                        except Exception as e:
-                            print(f"[PTQ] Falha ao gerar gráfico comparativo: {e}")
                     except Exception as e:
                         print(f"[PTQ] Falha ao salvar JSON de métricas PTQ: {e}")
                 except Exception as e:
                     print(f"[PTQ] Erro ao gerar mosaico quantizado: {e}")
 
-            # Export
+            # Export (garantir dispositivo consistente: exportar em CPU)
             export_dir = normalize_path(args.ptq_output_dir)
             os.makedirs(export_dir, exist_ok=True)
             try:
-                sim.export(path=export_dir, filename_prefix="minl_ptq", dummy_input=torch.randn(1, lenslet_ds.in_dim, device=device))
+                prev_device = next(combined.parameters()).device
+                sim.model.to('cpu')
+                sim.export(path=export_dir, filename_prefix="minl_ptq", dummy_input=torch.randn(1, lenslet_ds.in_dim, device='cpu'))
                 print(f"[PTQ] Artefatos exportados para: {export_dir}")
+                # restaurar
+                sim.model.to(prev_device)
+                try:
+                    _append_log(f"PTQ_EXPORT {export_dir}")
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[PTQ] Falha ao exportar artefatos: {e}")
+
+            # Varredura de checkpoints para curva PTQ por época (pós-treino)
+            if args.ptq_sweep_checkpoints:
+                try:
+                    import glob, re, copy, json
+                    ckpt_dir = normalize_path(args.ckpt_dir)
+                    pattern = os.path.join(ckpt_dir, "minl_ep*.pth")
+                    ckpt_files = sorted(glob.glob(pattern))
+                    if not ckpt_files:
+                        print(f"[PTQ][SWEEP] Nenhum checkpoint encontrado em '{ckpt_dir}'. Ative --save-ckpt ou ajuste --ckpt-dir.")
+                    else:
+                        print(f"[PTQ][SWEEP] Encontrados {len(ckpt_files)} checkpoints. Avaliando PTQ por checkpoint...")
+                        # Guardar estado atual para restaurar ao final
+                        state_mlp = copy.deepcopy(mlp.state_dict())
+                        state_cnn = copy.deepcopy(cnn.state_dict())
+
+                        # Preparar loaders reutilizados
+                        from torch.utils.data import DataLoader
+                        recon_loader = DataLoader(lenslet_ds, batch_size=args.batch_size, shuffle=False,
+                                                  num_workers=args.num_workers, pin_memory=pin_memory)
+
+                        sweep_epochs: list[int] = []
+                        sweep_psnr: list[float] = []
+                        sweep_ssim: list[float] = []
+
+                        quant_scheme_map = {
+                            'tf': QuantScheme.post_training_tf,
+                            'tf_enhanced': QuantScheme.post_training_tf_enhanced,
+                            'percentile': QuantScheme.post_training_percentile
+                        }
+                        qscheme_sweep = quant_scheme_map[args.ptq_quant_scheme]
+
+                        # Regex para extrair número da época do nome do arquivo
+                        rx = re.compile(r"minl_ep(\d+)\.pth$")
+
+                        for ckpt_path in ckpt_files:
+                            try:
+                                m = rx.search(os.path.basename(ckpt_path))
+                                ep_ckpt = int(m.group(1)) if m else None
+                                print(f"[PTQ][SWEEP] Checkpoint: {ckpt_path} (epoch={ep_ckpt})")
+                                data = torch.load(ckpt_path, map_location=device)
+                                mlp.load_state_dict(data['mlp_state'])
+                                cnn.load_state_dict(data['cnn_state'])
+
+                                # Criar sim para este checkpoint
+                                sim_ck = QuantizationSimModel(
+                                    model=combined,
+                                    quant_scheme=qscheme_sweep,
+                                    default_output_bw=args.ptq_act_bits,
+                                    default_param_bw=args.ptq_wt_bits,
+                                    dummy_input=torch.randn(2, lenslet_ds.in_dim, device=device)
+                                )
+                                if args.ptq_quant_scheme == 'percentile':
+                                    for qc in sim_ck.quant_wrappers():
+                                        for quantizer in qc.output_quantizers:
+                                            quantizer.is_percentile_enabled = True
+                                            quantizer.percentile_value = args.ptq_percentile
+
+                                # Calibração rápida
+                                def _fp_ck(model, _=None):
+                                    model.eval()
+                                    batches = 0
+                                    with torch.no_grad():
+                                        for xb_calib, _ in recon_loader:
+                                            xb_calib = xb_calib.to(device, non_blocking=pin_memory)
+                                            _ = model(xb_calib)
+                                            batches += 1
+                                            if batches >= args.ptq_calib_batches:
+                                                break
+                                sim_ck.compute_encodings(_fp_ck, None)
+
+                                # Métricas deste checkpoint (quantizado)
+                                preds_q = []
+                                sim_ck.model.eval()
+                                with torch.no_grad():
+                                    for xb_batch, _ in recon_loader:
+                                        xb_batch = xb_batch.to(device, non_blocking=pin_memory)
+                                        pred_batch = sim_ck.model(xb_batch).cpu()
+                                        preds_q.append(pred_batch)
+                                preds_q = torch.cat(preds_q, dim=0)
+                                mosaic_q = assemble_mosaic(preds_q.view(Hm*Wm, C, U, V), Hm=Hm, Wm=Wm).clamp(0,1)
+                                psnr_q_ck = psnr_torch(mosaic_q, mosaic_gt).item()
+                                ssim_q_ck = ssim_torch(mosaic_q, mosaic_gt).item()
+
+                                sweep_epochs.append(ep_ckpt if ep_ckpt is not None else len(sweep_epochs)+1)
+                                sweep_psnr.append(psnr_q_ck)
+                                sweep_ssim.append(ssim_q_ck)
+
+                                print(f"[PTQ][SWEEP] ep={ep_ckpt}: PSNR={psnr_q_ck:.3f} dB | SSIM={ssim_q_ck:.4f}")
+                                del sim_ck
+                            except Exception as e:
+                                print(f"[PTQ][SWEEP] Falha no checkpoint '{ckpt_path}': {e}")
+
+                        # Restaurar modelo original treinado
+                        mlp.load_state_dict(state_mlp)
+                        cnn.load_state_dict(state_cnn)
+
+                        # Persistir resultados
+                        q_dir = normalize_path(args.ptq_output_dir)
+                        os.makedirs(q_dir, exist_ok=True)
+                        try:
+                            sweep_json = {
+                                'sweep_epochs': sweep_epochs,
+                                'sweep_psnr_ptq': sweep_psnr,
+                                'sweep_ssim_ptq': sweep_ssim,
+                            }
+                            with open(os.path.join(q_dir, 'ptq_sweep.json'), 'w') as f:
+                                json.dump(sweep_json, f, indent=2)
+                            print(f"[PTQ][SWEEP] JSON salvo em {os.path.join(q_dir, 'ptq_sweep.json')}")
+                        except Exception as e:
+                            print(f"[PTQ][SWEEP] Falha ao salvar JSON: {e}")
+
+                        # Plotar curvas: float vs PTQ (sweep)
+                        try:
+                            fig3, axes3 = plt.subplots(2, 1, figsize=(6, 8))
+                            epochs_axis = list(range(1, len(psnr_history)+1))
+                            axes3[0].plot(epochs_axis, psnr_history, '-o', label='Float (treino)')
+                            axes3[0].plot(sweep_epochs, sweep_psnr, 'x--', label='PTQ (checkpoints)')
+                            axes3[0].set_title('PSNR Float vs PTQ')
+                            axes3[0].set_xlabel('Epoch'); axes3[0].set_ylabel('PSNR (dB)'); axes3[0].legend()
+                            axes3[1].plot(epochs_axis, ssim_history, '-o', color='tab:blue', label='Float (treino)')
+                            axes3[1].plot(sweep_epochs, sweep_ssim, '-o', color='tab:orange', label='PTQ')
+                            axes3[1].set_title('SSIM Float vs PTQ (checkpoints)')
+                            axes3[1].set_xlabel('Epoch'); axes3[1].set_ylabel('SSIM'); axes3[1].legend()
+                            plt.tight_layout()
+                            sweep_plot = os.path.join(q_dir, 'ptq_sweep.png')
+                            fig3.savefig(sweep_plot)
+                            plt.close(fig3)
+                            print(f"[PTQ][SWEEP] Gráfico salvo em: {sweep_plot}")
+                        except Exception as e:
+                            print(f"[PTQ][SWEEP] Falha ao gerar gráfico de sweep: {e}")
+                except Exception as e:
+                    print(f"[PTQ][SWEEP] Erro geral na varredura de checkpoints: {e}")
 
     # If user asked to save reconstructions but the final epoch wasn't on a save interval,
     # save one final reconstruction now so the user always gets the last prediction.
@@ -672,6 +1041,10 @@ def main():
                     psnrF = psnr_torch(mosaic, mosaic_gt).item()
                     ssimF = ssim_torch(mosaic, mosaic_gt).item()
                     print(f"Final: PSNR={psnrF:.3f} dB | SSIM={ssimF:.4f}")
+                    try:
+                        _append_log(f"FINAL_METRIC PSNR={psnrF:.6f} SSIM={ssimF:.6f}")
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"Falha ao calcular PSNR/SSIM (final): {e}")
                 # salvar imagem
